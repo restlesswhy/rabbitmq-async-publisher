@@ -1,7 +1,6 @@
 package app
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"rabbit/config"
@@ -21,7 +20,7 @@ const (
 	resendDelay = 5 * time.Second
 )
 
-var ErrClosed = errors.New("rbt closed")
+var ErrClosed = errors.New("rmq closed")
 
 type Params struct {
 	Queue    string
@@ -119,20 +118,20 @@ func (r *rmq) connect(cfg *config.Config) bool {
 		return false
 	}
 
-	_, err = ch.QueueDeclare(
-		r.queue,
-		true,  // Durable
-		false, // Delete when unused
-		false, // Exclusive
-		false, // No-wait
-		nil,   // Arguments
-	)
-	if err != nil {
-		logrus.Errorf(`declare %s queue error: %v`, r.queue, err)
-		return false
-	}
+	// _, err = ch.QueueDeclare(
+	// 	r.queue,
+	// 	true,  // Durable
+	// 	true,  // Delete when unused
+	// 	false, // Exclusive
+	// 	false, // No-wait
+	// 	nil,   // Arguments
+	// )
+	// if err != nil {
+	// 	logrus.Errorf(`declare %s queue error: %v`, r.queue, err)
+	// 	return false
+	// }
 
-	exchange := fmt.Sprintf(`direct_%s`, r.queue)
+	exchange := `direct_logs`
 	if err := ch.ExchangeDeclare(
 		exchange,
 		amqp.ExchangeDirect,
@@ -147,11 +146,11 @@ func (r *rmq) connect(cfg *config.Config) bool {
 		return false
 	}
 
-	if err := ch.QueueBind(r.queue, r.routeKey, exchange, false, nil); err != nil {
-		logrus.Errorf(`bina queue %s error: %v`, r.queue, err)
+	// if err := ch.QueueBind(r.queue, r.routeKey, exchange, false, nil); err != nil {
+	// 	logrus.Errorf(`bind queue %s error: %v`, r.queue, err)
 
-		return false
-	}
+	// 	return false
+	// }
 
 	r.changeConnection(conn, ch)
 	r.isConnected = true
@@ -175,13 +174,21 @@ func (r *rmq) run() {
 
 main:
 	for {
+		if !r.isConnected {
+			continue
+		}
+
 		select {
 		case <-r.close:
 			break main
 
 		case <-t:
-			r.channel.Publish(
-				fmt.Sprintf(`direct_%s`, r.queue),
+			if !r.isConnected {
+				continue
+			}
+
+			if err := r.channel.Publish(
+				"direct_logs",
 				r.routeKey,
 				false,
 				false,
@@ -189,18 +196,11 @@ main:
 					ContentType: "text/plain",
 					Body:        []byte(r.queue),
 				},
-			)
-		case msg, ok := <-r.recvQ:
-			if !ok {
-				// connectionDropped = true
-				return
+			); err != nil {
+				logrus.Errorf("send message %s error: %v", r.queue, err)
 			}
-			var res Message
-			if err := json.Unmarshal(msg.Body, &res); err != nil {
-				logrus.Errorf("unmarshal body error: %v", err)
-				break
-			}
-			fmt.Printf("MSG: %v\n", res)
+
+			logrus.Infof("Send: %s", r.queue)
 		}
 	}
 
