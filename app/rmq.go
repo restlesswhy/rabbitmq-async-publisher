@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"rabbit/config"
+	"rabbit/models"
 	"sync"
 	"time"
 
@@ -22,16 +23,6 @@ const (
 
 var ErrClosed = errors.New("rmq closed")
 
-type Params struct {
-	Queue    string
-	RouteKey string
-	Delay    time.Duration
-}
-
-type Message struct {
-	Text string `json:"text"`
-}
-
 type Rmq interface {
 	io.Closer
 }
@@ -45,25 +36,21 @@ type rmq struct {
 	notifyClose   chan *amqp.Error
 	notifyConfirm chan amqp.Confirmation
 
-	close chan struct{}
+	sendCh chan *models.MessageRequest
 
-	delay    time.Duration
-	queue    string
-	routeKey string
+	close chan struct{}
 
 	isConnected bool
 	alive       bool
 }
 
-func New(cfg *config.Config, params *Params) Rmq {
+func New(cfg *config.Config) Rmq {
 	rmq := &rmq{
-		wg:       &sync.WaitGroup{},
-		cfg:      cfg,
-		close:    make(chan struct{}),
-		delay:    params.Delay,
-		queue:    params.Queue,
-		routeKey: params.RouteKey,
-		alive:    true,
+		wg:     &sync.WaitGroup{},
+		cfg:    cfg,
+		close:  make(chan struct{}),
+		sendCh: make(chan *models.MessageRequest),
+		alive:  true,
 	}
 
 	rmq.wg.Add(2)
@@ -71,6 +58,13 @@ func New(cfg *config.Config, params *Params) Rmq {
 	go rmq.run()
 
 	return rmq
+}
+
+func (r *rmq) hReconnect() {
+	select {
+	case condition:
+
+	}
 }
 
 func (r *rmq) handleReconnect() {
@@ -118,19 +112,6 @@ func (r *rmq) connect(cfg *config.Config) bool {
 		return false
 	}
 
-	// _, err = ch.QueueDeclare(
-	// 	r.queue,
-	// 	true,  // Durable
-	// 	false, // Delete when unused
-	// 	false, // Exclusive
-	// 	false, // No-wait
-	// 	nil,   // Arguments
-	// )
-	// if err != nil {
-	// 	logrus.Errorf(`declare %s queue error: %v`, r.queue, err)
-	// 	return false
-	// }
-
 	exchange := `logs`
 	if err := ch.ExchangeDeclare(
 		exchange,
@@ -145,12 +126,6 @@ func (r *rmq) connect(cfg *config.Config) bool {
 
 		return false
 	}
-
-	// if err := ch.QueueBind(r.queue, r.routeKey, exchange, false, nil); err != nil {
-	// 	logrus.Errorf(`bind queue %s error: %v`, r.queue, err)
-
-	// 	return false
-	// }
 
 	r.changeConnection(conn, ch)
 	r.isConnected = true
@@ -170,37 +145,43 @@ func (r *rmq) changeConnection(connection *amqp.Connection, channel *amqp.Channe
 func (r *rmq) run() {
 	defer r.wg.Done()
 
-	t := time.NewTicker(r.delay)
-
 main:
 	for {
 		select {
 		case <-r.close:
 			break main
 
-		case <-t.C:
-			if !r.isConnected {
+		case msg := <-r.sendCh:
+			if err := r.channel.Publish(
+				r.cfg.Exchange,
+				r.cfg.RouteKey,
+				false,
+				false,
+				msg.Message.PrepareToPublish(),
+			); err != nil {
+				msg.Err <- errors.Wrapf(err, "send message '%s' error", msg.Message.Text)
 				continue
 			}
 
-			if err := r.channel.Publish(
-				"logs",
-				"wkey",
-				false,
-				false,
-				amqp.Publishing{
-					ContentType: "text/plain",
-					Body:        []byte(r.queue),
-				},
-			); err != nil {
-				logrus.Errorf("send message %s error: %v", r.queue, err)
-			}
+			msg.Err <- nil
 
-			logrus.Infof("Send: %s", r.queue)
+			logrus.Infof("message '%s' successfully sended", msg.Message.Text)
 		}
 	}
 
-	logrus.Info("RBT closed!")
+	logrus.Info("rmq sender closed!")
+}
+
+func (r *rmq) SendMessage(msg *models.Message) error {
+	err := make(chan error)
+	defer close(err)
+
+	r.sendCh <- &models.MessageRequest{
+		Message: msg,
+		Err:     err,
+	}
+
+	return <-err
 }
 
 func (r *rmq) Close() error {

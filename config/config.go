@@ -7,9 +7,9 @@ import (
 )
 
 type Config struct {
-	PullQueue string `mapstructure:"PULL_QUEUE"`
-	PushQueue string `mapstructure:"PUSH_QUEUE"`
-	Addr      string `mapstructure:"ADDR"`
+	Exchange string `mapstructure:"EXCHANGE"`
+	RouteKey string `mapstructure:"ROUTE_KEY"`
+	Addr     string `mapstructure:"ADDR"`
 }
 
 func Load() *Config {
