@@ -20,17 +20,17 @@ func main() {
 		Delay: 1 * time.Second,
 	})	
 
-	errorPublisher := app.New(cfg, &app.Params{
-		Queue: "ERROR",
-		RouteKey: "error_key",
-		Delay: 2 * time.Second,
-	})
+	// errorPublisher := app.New(cfg, &app.Params{
+	// 	Queue: "ERROR",
+	// 	RouteKey: "error_key",
+	// 	Delay: 2 * time.Second,
+	// })
 
-	debugPublisher := app.New(cfg, &app.Params{
-		Queue: "DEBUG",
-		RouteKey: "debug_key",
-		Delay: 3 * time.Second,
-	})
+	// debugPublisher := app.New(cfg, &app.Params{
+	// 	Queue: "DEBUG",
+	// 	RouteKey: "debug_key",
+	// 	Delay: 3 * time.Second,
+	// })
 
 	grace := make(chan os.Signal, 1)
 	signal.Notify(grace, os.Interrupt)
@@ -39,7 +39,7 @@ func main() {
 	<-grace
 
 	warnPublisher.Close()
-	errorPublisher.Close()
-	debugPublisher.Close()
+	// errorPublisher.Close()
+	// debugPublisher.Close()
 	logrus.Info("Gracefully closed!")
 }

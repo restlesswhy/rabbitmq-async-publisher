@@ -121,7 +121,7 @@ func (r *rmq) connect(cfg *config.Config) bool {
 	// _, err = ch.QueueDeclare(
 	// 	r.queue,
 	// 	true,  // Durable
-	// 	true,  // Delete when unused
+	// 	false, // Delete when unused
 	// 	false, // Exclusive
 	// 	false, // No-wait
 	// 	nil,   // Arguments
@@ -131,12 +131,12 @@ func (r *rmq) connect(cfg *config.Config) bool {
 	// 	return false
 	// }
 
-	exchange := `direct_logs`
+	exchange := `logs`
 	if err := ch.ExchangeDeclare(
 		exchange,
 		amqp.ExchangeDirect,
 		true,
-		true,
+		false,
 		false,
 		false,
 		nil,
@@ -170,26 +170,22 @@ func (r *rmq) changeConnection(connection *amqp.Connection, channel *amqp.Channe
 func (r *rmq) run() {
 	defer r.wg.Done()
 
-	t := time.Tick(r.delay)
+	t := time.NewTicker(r.delay)
 
 main:
 	for {
-		if !r.isConnected {
-			continue
-		}
-
 		select {
 		case <-r.close:
 			break main
 
-		case <-t:
+		case <-t.C:
 			if !r.isConnected {
 				continue
 			}
 
 			if err := r.channel.Publish(
-				"direct_logs",
-				r.routeKey,
+				"logs",
+				"wkey",
 				false,
 				false,
 				amqp.Publishing{
@@ -215,14 +211,16 @@ func (r *rmq) Close() error {
 		close(r.close)
 		r.wg.Wait()
 
-		err := r.channel.Close()
-		if err != nil {
-			return err
+		if r.channel != nil {
+			if err := r.channel.Close(); err != nil {
+				return err
+			}
 		}
 
-		err = r.connection.Close()
-		if err != nil {
-			return err
+		if r.connection != nil {
+			if err := r.connection.Close(); err != nil {
+				return err
+			}
 		}
 
 		return nil
