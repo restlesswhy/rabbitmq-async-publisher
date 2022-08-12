@@ -6,6 +6,7 @@ import (
 
 	"rabbit/app"
 	"rabbit/config"
+	"rabbit/models"
 
 	"github.com/sirupsen/logrus"
 )
@@ -13,7 +14,16 @@ import (
 func main() {
 	cfg := config.Load()
 
-	rmq := app.New(cfg)
+	rmq, err := app.New(cfg)
+	if err != nil {
+		logrus.Fatal(err)
+	}
+
+	if err := rmq.SendMessage(&models.Message{
+		Text: "asd",
+	}); err != nil {
+		logrus.Fatalf("send message error: %v", err)
+	}
 
 	grace := make(chan os.Signal, 1)
 	signal.Notify(grace, os.Interrupt)

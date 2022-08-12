@@ -1,7 +1,6 @@
 package app
 
 import (
-	"fmt"
 	"io"
 	"rabbit/config"
 	"rabbit/models"
@@ -23,43 +22,50 @@ const (
 
 var ErrClosed = errors.New("rmq closed")
 
+type reconnecter struct {
+	res chan error
+}
+
 type Rmq interface {
 	io.Closer
+	SendMessage(msg *models.Message) error
 }
 
 type rmq struct {
 	wg  *sync.WaitGroup
 	cfg *config.Config
 
-	connection    *amqp.Connection
-	channel       *amqp.Channel
-	notifyClose   chan *amqp.Error
-	notifyConfirm chan amqp.Confirmation
+	connection            *amqp.Connection
+	channel               *amqp.Channel
+	notifyChannelClose    chan *amqp.Error
+	notifyConnectionClose chan *amqp.Error
+	notifyConfirm         chan amqp.Confirmation
+	err                   chan *reconnecter
 
 	sendCh chan *models.MessageRequest
 
 	close chan struct{}
 
 	isConnected bool
-	alive       bool
 }
 
-
-
-func New(cfg *config.Config) Rmq {
+func New(cfg *config.Config) (Rmq, error) {
 	rmq := &rmq{
 		wg:     &sync.WaitGroup{},
 		cfg:    cfg,
 		close:  make(chan struct{}),
 		sendCh: make(chan *models.MessageRequest),
-		alive:  true,
+	}
+
+	if err := rmq.Connect(); err != nil {
+		return nil, errors.Wrap(err, "connect or rabbitmq error")
 	}
 
 	rmq.wg.Add(2)
-	go rmq.handleReconnect()
+	go rmq.reconnecter()
 	go rmq.run()
 
-	return rmq
+	return rmq, nil
 }
 
 func (r *rmq) Connect() error {
@@ -70,102 +76,165 @@ func (r *rmq) Connect() error {
 		return errors.Wrap(err, `dial rabbit error`)
 	}
 
-	go func() {
-		select {
-		case <- r.connection.NotifyClose(make(chan *amqp.Error)):
-			
-		}
-		<-r.connection.NotifyClose(make(chan *amqp.Error)) //Listen to NotifyClose
-		c.err <- errors.New("Connection Closed")
-	}()
-
 	r.channel, err = r.connection.Channel()
 	if err != nil {
 		return errors.Wrap(err, `conn to channel error`)
 	}
-}
 
-func (r *rmq) hReconnect() {
-	select {
-	case condition:
+	r.connection.NotifyClose(r.notifyConnectionClose)
+	r.channel.NotifyClose(r.notifyChannelClose)
 
-	}
-}
-
-func (r *rmq) handleReconnect() {
-	defer func() {
-		r.wg.Done()
-		logrus.Printf("Stop reconnecting to rabbitMQ")
-	}()
-
-	for r.alive {
-		r.isConnected = false
-		t := time.Now()
-		fmt.Printf("Attempting to connect to rabbitMQ: %s\n", r.cfg.Addr)
-		var retryCount int
-		for !r.connect(r.cfg) {
-			if !r.alive {
-				return
-			}
-			select {
-			case <-r.close:
-				return
-			case <-time.After(reconnectDelay + time.Duration(retryCount)*time.Second):
-				logrus.Printf("disconnected from rabbitMQ and failed to connect")
-				retryCount++
-			}
-		}
-		logrus.Printf("Connected to rabbitMQ in: %vms", time.Since(t).Milliseconds())
-		select {
-		case <-r.close:
-			return
-		case <-r.notifyClose:
-		}
-	}
-}
-
-func (r *rmq) connect(cfg *config.Config) bool {
-	conn, err := amqp.Dial(cfg.Addr)
-	if err != nil {
-		logrus.Errorf(`dial rabbit error: %v`, err)
-		return false
-	}
-
-	ch, err := conn.Channel()
-	if err != nil {
-		logrus.Errorf(`conn to channel error: %v`, err)
-		return false
-	}
-
-	exchange := `logs`
-	if err := ch.ExchangeDeclare(
-		exchange,
-		amqp.ExchangeDirect,
-		true,
-		false,
-		false,
-		false,
-		nil,
+	if err := r.channel.ExchangeDeclare(
+		r.cfg.Exchange,      // name
+		amqp.ExchangeDirect, // type
+		true,                // durable
+		false,               // auto-deleted
+		false,               // internal
+		false,               // noWait
+		nil,                 // arguments
 	); err != nil {
-		logrus.Errorf(`declare exchange %s error: %v`, exchange, err)
-
-		return false
+		return errors.Wrap(err, "declare exchange error")
 	}
-
-	r.changeConnection(conn, ch)
+	
 	r.isConnected = true
 
-	return true
+	return nil
 }
 
-func (r *rmq) changeConnection(connection *amqp.Connection, channel *amqp.Channel) {
-	r.connection = connection
-	r.channel = channel
-	r.notifyClose = make(chan *amqp.Error)
-	r.notifyConfirm = make(chan amqp.Confirmation)
-	r.channel.NotifyClose(r.notifyClose)
-	r.channel.NotifyPublish(r.notifyConfirm)
+func (r *rmq) listenCloseConn() {
+	defer r.wg.Done()
+
+main:
+	for {
+		select {
+		case <-r.close:
+			break main
+
+		case <-r.notifyChannelClose:
+			r.handleRec()
+
+		case <-r.notifyConnectionClose:
+			r.handleRec()
+		}
+	}
 }
+
+func (r *rmq) handleRec() error {
+	res := make(chan error)
+	defer close(res)
+
+	for {
+		r.err <- &reconnecter{
+			res: res,
+		}
+
+		select {
+		case <-r.close:
+			return ErrClosed
+
+		case err := <-res:
+			if err != nil {
+				continue
+			} else {
+				return nil
+			}
+		}
+	}
+}
+
+func (r *rmq) reconnecter() {
+	defer r.wg.Done()
+
+main:
+	for {
+		select {
+		case <-r.close:
+			break main
+
+		case rec := <-r.err:
+			if err := r.Connect(); err != nil {
+				rec.res <- errors.Wrap(err, "connect or rabbitmq error")
+				continue
+			}
+			rec.res <- nil
+		}
+	}
+}
+
+// func (r *rmq) handleReconnect() {
+// 	defer func() {
+// 		r.wg.Done()
+// 		logrus.Printf("Stop reconnecting to rabbitMQ")
+// 	}()
+
+// 	for r.alive {
+// 		r.isConnected = false
+// 		t := time.Now()
+// 		fmt.Printf("Attempting to connect to rabbitMQ: %s\n", r.cfg.Addr)
+// 		var retryCount int
+// 		for !r.connect(r.cfg) {
+// 			if !r.alive {
+// 				return
+// 			}
+// 			select {
+// 			case <-r.close:
+// 				return
+// 			case <-time.After(reconnectDelay + time.Duration(retryCount)*time.Second):
+// 				logrus.Printf("disconnected from rabbitMQ and failed to connect")
+// 				retryCount++
+// 			}
+// 		}
+// 		logrus.Printf("Connected to rabbitMQ in: %vms", time.Since(t).Milliseconds())
+// 		select {
+// 		case <-r.close:
+// 			return
+// 		case <-r.notifyClose:
+// 		}
+// 	}
+// }
+
+// func (r *rmq) connect(cfg *config.Config) bool {
+// 	conn, err := amqp.Dial(cfg.Addr)
+// 	if err != nil {
+// 		logrus.Errorf(`dial rabbit error: %v`, err)
+// 		return false
+// 	}
+
+// 	ch, err := conn.Channel()
+// 	if err != nil {
+// 		logrus.Errorf(`conn to channel error: %v`, err)
+// 		return false
+// 	}
+
+// 	exchange := `logs`
+// 	if err := ch.ExchangeDeclare(
+// 		exchange,
+// 		amqp.ExchangeDirect,
+// 		true,
+// 		false,
+// 		false,
+// 		false,
+// 		nil,
+// 	); err != nil {
+// 		logrus.Errorf(`declare exchange %s error: %v`, exchange, err)
+
+// 		return false
+// 	}
+
+// 	r.changeConnection(conn, ch)
+// 	r.isConnected = true
+
+// 	return true
+// }
+
+// func (r *rmq) changeConnection(connection *amqp.Connection, channel *amqp.Channel) {
+// 	r.connection = connection
+// 	r.channel = channel
+// 	r.notifyClose = make(chan *amqp.Error)
+// 	r.notifyConfirm = make(chan amqp.Confirmation)
+// 	r.channel.NotifyClose(r.notifyClose)
+// 	r.channel.NotifyPublish(r.notifyConfirm)
+// }
 
 func (r *rmq) run() {
 	defer r.wg.Done()
