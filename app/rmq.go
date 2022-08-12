@@ -44,6 +44,8 @@ type rmq struct {
 	alive       bool
 }
 
+
+
 func New(cfg *config.Config) Rmq {
 	rmq := &rmq{
 		wg:     &sync.WaitGroup{},
@@ -58,6 +60,29 @@ func New(cfg *config.Config) Rmq {
 	go rmq.run()
 
 	return rmq
+}
+
+func (r *rmq) Connect() error {
+	var err error
+
+	r.connection, err = amqp.Dial(r.cfg.Addr)
+	if err != nil {
+		return errors.Wrap(err, `dial rabbit error`)
+	}
+
+	go func() {
+		select {
+		case <- r.connection.NotifyClose(make(chan *amqp.Error)):
+			
+		}
+		<-r.connection.NotifyClose(make(chan *amqp.Error)) //Listen to NotifyClose
+		c.err <- errors.New("Connection Closed")
+	}()
+
+	r.channel, err = r.connection.Channel()
+	if err != nil {
+		return errors.Wrap(err, `conn to channel error`)
+	}
 }
 
 func (r *rmq) hReconnect() {
@@ -152,6 +177,11 @@ main:
 			break main
 
 		case msg := <-r.sendCh:
+			if !r.isConnected {
+				msg.Err <- errors.New("rmq service is not avilable")
+				continue
+			}
+
 			if err := r.channel.Publish(
 				r.cfg.Exchange,
 				r.cfg.RouteKey,
