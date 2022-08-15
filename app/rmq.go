@@ -37,9 +37,7 @@ type rmq struct {
 
 	connection            *amqp.Connection
 	channel               *amqp.Channel
-	notifyChannelClose    chan *amqp.Error
 	notifyConnectionClose chan *amqp.Error
-	notifyConfirm         chan amqp.Confirmation
 	err                   chan *reconnecter
 
 	sendCh chan *models.MessageRequest
@@ -53,6 +51,7 @@ func New(cfg *config.Config) (Rmq, error) {
 	rmq := &rmq{
 		wg:     &sync.WaitGroup{},
 		cfg:    cfg,
+		err:    make(chan *reconnecter),
 		close:  make(chan struct{}),
 		sendCh: make(chan *models.MessageRequest),
 	}
@@ -61,7 +60,8 @@ func New(cfg *config.Config) (Rmq, error) {
 		return nil, errors.Wrap(err, "connect or rabbitmq error")
 	}
 
-	rmq.wg.Add(2)
+	rmq.wg.Add(3)
+	go rmq.listenCloseConn()
 	go rmq.reconnecter()
 	go rmq.run()
 
@@ -81,8 +81,8 @@ func (r *rmq) Connect() error {
 		return errors.Wrap(err, `conn to channel error`)
 	}
 
+	r.notifyConnectionClose = make(chan *amqp.Error)
 	r.connection.NotifyClose(r.notifyConnectionClose)
-	r.channel.NotifyClose(r.notifyChannelClose)
 
 	if err := r.channel.ExchangeDeclare(
 		r.cfg.Exchange,      // name
@@ -95,7 +95,7 @@ func (r *rmq) Connect() error {
 	); err != nil {
 		return errors.Wrap(err, "declare exchange error")
 	}
-	
+
 	r.isConnected = true
 
 	return nil
@@ -110,20 +110,25 @@ main:
 		case <-r.close:
 			break main
 
-		case <-r.notifyChannelClose:
-			r.handleRec()
-
 		case <-r.notifyConnectionClose:
+			r.isConnected = false
+			logrus.Warn("Connection is closed! Trying to reconnect...")
 			r.handleRec()
 		}
 	}
+
+	logrus.Info("Connection listener is closed")
 }
 
 func (r *rmq) handleRec() error {
 	res := make(chan error)
 	defer close(res)
 
+	attempts := 1
 	for {
+		time.Sleep(reconnectDelay + time.Second*time.Duration(attempts))
+
+		logrus.Infof("%d attempt to reconnect...", attempts)
 		r.err <- &reconnecter{
 			res: res,
 		}
@@ -134,8 +139,12 @@ func (r *rmq) handleRec() error {
 
 		case err := <-res:
 			if err != nil {
+				attempts++
+				logrus.Errorf("Failed to connect: %v", err)
 				continue
 			} else {
+				logrus.Info("Successfully connected!")
+				r.isConnected = true
 				return nil
 			}
 		}
@@ -159,82 +168,9 @@ main:
 			rec.res <- nil
 		}
 	}
+
+	logrus.Info("Reconnecter is closed")
 }
-
-// func (r *rmq) handleReconnect() {
-// 	defer func() {
-// 		r.wg.Done()
-// 		logrus.Printf("Stop reconnecting to rabbitMQ")
-// 	}()
-
-// 	for r.alive {
-// 		r.isConnected = false
-// 		t := time.Now()
-// 		fmt.Printf("Attempting to connect to rabbitMQ: %s\n", r.cfg.Addr)
-// 		var retryCount int
-// 		for !r.connect(r.cfg) {
-// 			if !r.alive {
-// 				return
-// 			}
-// 			select {
-// 			case <-r.close:
-// 				return
-// 			case <-time.After(reconnectDelay + time.Duration(retryCount)*time.Second):
-// 				logrus.Printf("disconnected from rabbitMQ and failed to connect")
-// 				retryCount++
-// 			}
-// 		}
-// 		logrus.Printf("Connected to rabbitMQ in: %vms", time.Since(t).Milliseconds())
-// 		select {
-// 		case <-r.close:
-// 			return
-// 		case <-r.notifyClose:
-// 		}
-// 	}
-// }
-
-// func (r *rmq) connect(cfg *config.Config) bool {
-// 	conn, err := amqp.Dial(cfg.Addr)
-// 	if err != nil {
-// 		logrus.Errorf(`dial rabbit error: %v`, err)
-// 		return false
-// 	}
-
-// 	ch, err := conn.Channel()
-// 	if err != nil {
-// 		logrus.Errorf(`conn to channel error: %v`, err)
-// 		return false
-// 	}
-
-// 	exchange := `logs`
-// 	if err := ch.ExchangeDeclare(
-// 		exchange,
-// 		amqp.ExchangeDirect,
-// 		true,
-// 		false,
-// 		false,
-// 		false,
-// 		nil,
-// 	); err != nil {
-// 		logrus.Errorf(`declare exchange %s error: %v`, exchange, err)
-
-// 		return false
-// 	}
-
-// 	r.changeConnection(conn, ch)
-// 	r.isConnected = true
-
-// 	return true
-// }
-
-// func (r *rmq) changeConnection(connection *amqp.Connection, channel *amqp.Channel) {
-// 	r.connection = connection
-// 	r.channel = channel
-// 	r.notifyClose = make(chan *amqp.Error)
-// 	r.notifyConfirm = make(chan amqp.Confirmation)
-// 	r.channel.NotifyClose(r.notifyClose)
-// 	r.channel.NotifyPublish(r.notifyConfirm)
-// }
 
 func (r *rmq) run() {
 	defer r.wg.Done()
@@ -268,7 +204,7 @@ main:
 		}
 	}
 
-	logrus.Info("rmq sender closed!")
+	logrus.Info("Rmq sender is closed!")
 }
 
 func (r *rmq) SendMessage(msg *models.Message) error {
