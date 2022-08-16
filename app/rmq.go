@@ -48,6 +48,8 @@ type rmq struct {
 }
 
 func New(cfg *config.Config) (Rmq, error) {
+	// threads := runtime.NumCPU()
+
 	rmq := &rmq{
 		wg:     &sync.WaitGroup{},
 		cfg:    cfg,
@@ -60,10 +62,14 @@ func New(cfg *config.Config) (Rmq, error) {
 		return nil, errors.Wrap(err, "connect or rabbitmq error")
 	}
 
-	rmq.wg.Add(3)
+	rmq.wg.Add(2)
 	go rmq.listenCloseConn()
-	go rmq.reconnecter()
 	go rmq.run()
+
+	// rmq.wg.Add(threads)
+	// for i := 0; i < threads; i++ {
+	// 	go rmq.run()
+	// }
 
 	return rmq, nil
 }
@@ -111,6 +117,10 @@ main:
 			break main
 
 		case <-r.notifyConnectionClose:
+			if r.isConnected == false {
+				continue
+			}
+
 			r.isConnected = false
 			logrus.Warn("Connection is closed! Trying to reconnect...")
 			r.handleRec()
@@ -120,56 +130,32 @@ main:
 	logrus.Info("Connection listener is closed")
 }
 
-func (r *rmq) handleRec() error {
-	res := make(chan error)
-	defer close(res)
-
+func (r *rmq) handleRec() {
 	attempts := 1
 	for {
 		time.Sleep(reconnectDelay + time.Second*time.Duration(attempts))
-
-		logrus.Infof("%d attempt to reconnect...", attempts)
-		r.err <- &reconnecter{
-			res: res,
-		}
+		r.channel = nil
+		r.connection = nil
 
 		select {
 		case <-r.close:
-			return ErrClosed
+			logrus.Infof("Stop trying to connect: %v", ErrClosed)
+			return
 
-		case err := <-res:
-			if err != nil {
-				attempts++
+		default:
+			logrus.Infof("%d attempt to reconnect...", attempts)
+
+			if err := r.Connect(); err != nil {
 				logrus.Errorf("Failed to connect: %v", err)
+				attempts++
 				continue
 			} else {
 				logrus.Info("Successfully connected!")
 				r.isConnected = true
-				return nil
+				return
 			}
 		}
 	}
-}
-
-func (r *rmq) reconnecter() {
-	defer r.wg.Done()
-
-main:
-	for {
-		select {
-		case <-r.close:
-			break main
-
-		case rec := <-r.err:
-			if err := r.Connect(); err != nil {
-				rec.res <- errors.Wrap(err, "connect or rabbitmq error")
-				continue
-			}
-			rec.res <- nil
-		}
-	}
-
-	logrus.Info("Reconnecter is closed")
 }
 
 func (r *rmq) run() {
@@ -182,11 +168,6 @@ main:
 			break main
 
 		case msg := <-r.sendCh:
-			if !r.isConnected {
-				msg.Err <- errors.New("rmq service is not avilable")
-				continue
-			}
-
 			if err := r.channel.Publish(
 				r.cfg.Exchange,
 				r.cfg.RouteKey,
@@ -208,6 +189,10 @@ main:
 }
 
 func (r *rmq) SendMessage(msg *models.Message) error {
+	if !r.isConnected {
+		return errors.New("rmq service is not avilable")
+	}
+
 	err := make(chan error)
 	defer close(err)
 
