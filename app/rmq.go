@@ -35,10 +35,9 @@ type rmq struct {
 	wg  *sync.WaitGroup
 	cfg *config.Config
 
-	connection            *amqp.Connection
-	channel               *amqp.Channel
-	notifyConnectionClose chan *amqp.Error
-	err                   chan *reconnecter
+	connection  *amqp.Connection
+	channel     *amqp.Channel
+	notifyClose chan *amqp.Error
 
 	sendCh chan *models.MessageRequest
 
@@ -53,7 +52,6 @@ func New(cfg *config.Config) (Rmq, error) {
 	rmq := &rmq{
 		wg:     &sync.WaitGroup{},
 		cfg:    cfg,
-		err:    make(chan *reconnecter),
 		close:  make(chan struct{}),
 		sendCh: make(chan *models.MessageRequest),
 	}
@@ -87,8 +85,8 @@ func (r *rmq) Connect() error {
 		return errors.Wrap(err, `conn to channel error`)
 	}
 
-	r.notifyConnectionClose = make(chan *amqp.Error)
-	r.connection.NotifyClose(r.notifyConnectionClose)
+	r.notifyClose = make(chan *amqp.Error)
+	r.connection.NotifyClose(r.notifyClose)
 
 	if err := r.channel.ExchangeDeclare(
 		r.cfg.Exchange,      // name
@@ -116,7 +114,7 @@ main:
 		case <-r.close:
 			break main
 
-		case <-r.notifyConnectionClose:
+		case <-r.notifyClose:
 			if r.isConnected == false {
 				continue
 			}
